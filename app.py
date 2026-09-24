@@ -1,216 +1,280 @@
 import os
 import io
-import re
-import numpy as np
+import json
+from datetime import datetime
 from typing import List, Dict, Any
 import streamlit as st
-from pypdf import PdfReader
-from dotenv import load_dotenv
 
-# Optional Gemini Integration
-try:
-    import google.generativeai as genai
-    HAS_GENAI = True
-except ImportError:
-    HAS_GENAI = False
+from src.config import RAGConfig
+from src.pdf_processor import PDFProcessor, DocumentChunk
+from src.vector_store import VectorStore
+from src.rag_pipeline import RAGPipeline, RAGResponse
 
-load_dotenv()
-
-# Page configuration
+# --- Streamlit Page Configuration ---
 st.set_page_config(
     page_title="AI PDF Q&A Assistant",
     page_icon="📄",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Custom Styling
+# --- Custom Styling ---
 st.markdown("""
 <style>
     .main-title {
-        font-size: 2.2rem;
-        font-weight: 700;
+        font-size: 2.3rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
         margin-bottom: 0.2rem;
     }
-    .subtitle {
-        color: #6c757d;
+    .main-subtitle {
+        color: #64748b;
         font-size: 1.05rem;
-        margin-bottom: 1.5rem;
+        margin-bottom: 1.6rem;
     }
-    .source-box {
-        background-color: #f8f9fa;
-        border-left: 4px solid #4F46E5;
-        padding: 10px 15px;
+    .metric-card {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin-bottom: 12px;
+    }
+    .citation-badge {
+        display: inline-block;
+        background: #e0e7ff;
+        color: #4338ca;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-right: 6px;
+    }
+    .citation-card {
+        border-left: 3px solid #6366f1;
+        background: #f9fafb;
+        padding: 10px 14px;
         margin-top: 8px;
         border-radius: 4px;
-        font-size: 0.88rem;
     }
 </style>
 """, unsafe_allow_html=True)
 
 
-def extract_text_from_pdf(uploaded_file) -> List[Dict[str, Any]]:
-    """Extracts text page by page from an uploaded PDF file."""
-    reader = PdfReader(uploaded_file)
-    pages_data = []
-    for page_num, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = re.sub(r'\s+', ' ', text).strip()
-        if text:
-            pages_data.append({"page": page_num, "text": text})
-    return pages_data
-
-
-def chunk_text(pages_data: List[Dict[str, Any]], chunk_size: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
-    """Splits extracted page text into smaller overlapping chunks."""
-    chunks = []
-    chunk_id = 0
-    for item in pages_data:
-        text = item["text"]
-        page = item["page"]
-        start = 0
-        while start < len(text):
-            end = min(start + chunk_size, len(text))
-            chunk_content = text[start:end].strip()
-            if chunk_content:
-                chunks.append({
-                    "id": chunk_id,
-                    "page": page,
-                    "content": chunk_content
-                })
-                chunk_id += 1
-            start += (chunk_size - overlap)
-            if start >= len(text):
-                break
-    return chunks
-
-
-def simple_keyword_search(query: str, chunks: List[Dict[str, Any]], top_k: int = 4) -> List[Dict[str, Any]]:
-    """Fallback ranking based on token overlap when no embedding model is configured."""
-    query_tokens = set(re.findall(r'\w+', query.lower()))
-    scored_chunks = []
-    for chunk in chunks:
-        chunk_tokens = set(re.findall(r'\w+', chunk["content"].lower()))
-        overlap = len(query_tokens.intersection(chunk_tokens))
-        if overlap > 0:
-            scored_chunks.append((overlap, chunk))
-    scored_chunks.sort(key=lambda x: x[0], reverse=True)
-    return [item[1] for item in scored_chunks[:top_k]] or chunks[:top_k]
-
-
-def answer_with_gemini(api_key: str, question: str, relevant_chunks: List[Dict[str, Any]]) -> str:
-    """Generates an answer using Google Gemini model with the provided context."""
-    if not HAS_GENAI:
-        return "Error: `google-generativeai` package is not installed. Please run `pip install -r requirements.txt`."
-    
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        
-        context = "\n\n".join([f"[Page {c['page']}]: {c['content']}" for c in relevant_chunks])
-        prompt = f"""You are a helpful AI assistant answering questions based on the provided PDF document context.
-If the answer cannot be found in the context, politely state that the information is not present in the document.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:"""
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"An error occurred while contacting the Gemini API: {e}"
-
-
 # --- Session State Initialization ---
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
+if "rag_pipeline" not in st.session_state:
+    st.session_state.rag_config = RAGConfig()
+    st.session_state.vector_store = VectorStore()
+    st.session_state.rag_pipeline = RAGPipeline(
+        config=st.session_state.rag_config,
+        vector_store=st.session_state.vector_store
+    )
+
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "processed_file_name" not in st.session_state:
-    st.session_state.processed_file_name = None
+
+if "processed_docs" not in st.session_state:
+    st.session_state.processed_docs = {}
+
+if "total_chunks_count" not in st.session_state:
+    st.session_state.total_chunks_count = 0
+
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     
     api_key_input = st.text_input(
-        "Gemini API Key",
+        "Google Gemini API Key",
         type="password",
-        value=os.getenv("GEMINI_API_KEY", ""),
-        help="Enter your Google Gemini API key to enable AI-powered Q&A."
+        value=st.session_state.rag_config.gemini_api_key or "",
+        help="Get a free Gemini API key at: https://aistudio.google.com/app/apikey"
     )
-    
+
+    if api_key_input != st.session_state.rag_config.gemini_api_key:
+        st.session_state.rag_config.gemini_api_key = api_key_input
+        st.session_state.rag_pipeline.set_api_key(api_key_input)
+        if api_key_input:
+            st.success("API key updated!")
+
+    selected_model = st.selectbox(
+        "LLM Model",
+        options=["gemini-1.5-flash", "gemini-1.5-pro"],
+        index=0,
+        help="Select Gemini model for generation."
+    )
+    st.session_state.rag_config.llm_model_name = selected_model
+
+    with st.expander("🛠️ Advanced RAG Parameters"):
+        chunk_size = st.slider("Chunk Size (characters)", 300, 1500, 600, step=50)
+        chunk_overlap = st.slider("Chunk Overlap (characters)", 0, 300, 120, step=20)
+        top_k = st.slider("Top-K Passages to Retrieve", 1, 10, 4)
+        use_hybrid = st.checkbox("Enable Hybrid Search (Keyword Boost)", value=True)
+
+        st.session_state.rag_config.chunk_size = chunk_size
+        st.session_state.rag_config.chunk_overlap = chunk_overlap
+        st.session_state.rag_config.top_k = top_k
+        st.session_state.rag_config.use_hybrid_search = use_hybrid
+        st.session_state.vector_store.use_hybrid_search = use_hybrid
+
     st.markdown("---")
-    st.subheader("📁 Document Upload")
-    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
+    st.subheader("📁 Document Management")
+    uploaded_files = st.file_uploader(
+        "Upload PDF Document(s)",
+        type=["pdf"],
+        accept_multiple_files=True,
+        help="Select one or multiple PDF documents to analyze."
+    )
 
-    if uploaded_file is not None:
-        if st.session_state.processed_file_name != uploaded_file.name:
-            with st.spinner("Processing PDF document..."):
-                pages = extract_text_from_pdf(uploaded_file)
-                chunks = chunk_text(pages)
-                st.session_state.chunks = chunks
-                st.session_state.processed_file_name = uploaded_file.name
-                st.session_state.chat_history = []
-                st.success(f"Extracted {len(pages)} pages ({len(chunks)} chunks).")
+    if uploaded_files:
+        new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_docs]
+        if new_files:
+            with st.spinner("Processing documents & indexing vectors..."):
+                processor = PDFProcessor(
+                    chunk_size=st.session_state.rag_config.chunk_size,
+                    chunk_overlap=st.session_state.rag_config.chunk_overlap
+                )
+                all_new_chunks = []
+                for file_obj in new_files:
+                    pages = processor.extract_pages_from_stream(file_obj, filename=file_obj.name)
+                    chunks, meta = processor.chunk_document(pages)
+                    st.session_state.processed_docs[file_obj.name] = meta
+                    all_new_chunks.extend(chunks)
 
-    if st.session_state.chunks:
-        st.info(f"Loaded: **{st.session_state.processed_file_name}**")
-        if st.button("Clear Chat"):
+                st.session_state.vector_store.add_chunks(all_new_chunks)
+                st.session_state.total_chunks_count += len(all_new_chunks)
+                st.success(f"Indexed {len(new_files)} document(s) successfully!")
+
+    # Document stats
+    if st.session_state.processed_docs:
+        st.markdown("**Indexed Documents:**")
+        for doc_name, meta in st.session_state.processed_docs.items():
+            st.caption(f"• **{doc_name}** ({meta.total_pages} pages, {meta.total_chunks} chunks)")
+
+        if st.button("🗑️ Reset All Documents"):
+            st.session_state.vector_store.clear()
+            st.session_state.processed_docs = {}
+            st.session_state.total_chunks_count = 0
             st.session_state.chat_history = []
             st.rerun()
 
-# --- Main App Header ---
+    if st.session_state.chat_history:
+        if st.button("🧹 Clear Chat History"):
+            st.session_state.chat_history = []
+            st.rerun()
+
+
+# --- Main Content Area ---
 st.markdown('<div class="main-title">📄 AI PDF Q&A Assistant</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Upload any document and ask questions to get context-aware answers instantly.</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="main-subtitle">'
+    'Upload your research papers, manuals, or contracts and get accurate, cited answers in seconds.'
+    '</div>',
+    unsafe_allow_html=True
+)
 
-# --- Chat Interface ---
-if not st.session_state.chunks:
-    st.info("👈 Please upload a PDF in the sidebar to get started!")
+# Metric status cards
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.metric("Documents Loaded", len(st.session_state.processed_docs))
+with col2:
+    st.metric("Total Indexed Chunks", st.session_state.total_chunks_count)
+with col3:
+    status_label = "Gemini LLM Active" if st.session_state.rag_config.gemini_api_key else "Offline / Extractive"
+    st.metric("Operating Mode", status_label)
+
+st.markdown("---")
+
+# Empty State Notice
+if not st.session_state.processed_docs:
+    st.info("👈 **Upload one or more PDF files** using the sidebar to begin asking questions.")
+    
+    st.markdown("#### 💡 Quick Features:")
+    st.markdown("""
+    - **Multi-Document Support**: Query across several uploaded PDFs at once.
+    - **Grounded Citations**: Every answer provides page numbers and exact context snippets.
+    - **Hybrid Retrieval**: Combines semantic embeddings with keyword boosting for higher precision.
+    - **Offline Fallback**: Works immediately even without an API key using built-in extractive search!
+    """)
 else:
-    # Display previous messages
-    for msg in st.session_state.chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if "sources" in msg and msg["sources"]:
-                with st.expander("📚 View Reference Passages"):
-                    for s in msg["sources"]:
-                        st.markdown(f"**Page {s['page']}**")
-                        st.markdown(f"> {s['content']}")
+    # Render chat conversation
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            if message.get("citations"):
+                with st.expander("📚 View Reference Citations"):
+                    for idx, cit in enumerate(message["citations"], 1):
+                        st.markdown(
+                            f"<div class='citation-card'>"
+                            f"<span class='citation-badge'>Citation {idx}</span> "
+                            f"<strong>{cit['doc_name']}</strong> — Page {cit['page']}<br>"
+                            f"<em>\"{cit['snippet']}\"</em>"
+                            f"</div>",
+                            unsafe_allow_html=True
+                        )
 
-    # User input
-    if user_query := st.chat_input("Ask a question about the document..."):
-        # Show user message
+    # Chat Input
+    if user_query := st.chat_input("Ask a question about your documents..."):
+        # Display user question
         st.session_state.chat_history.append({"role": "user", "content": user_query})
         with st.chat_message("user"):
             st.markdown(user_query)
 
-        # Retrieve relevant passages
-        relevant_chunks = simple_keyword_search(user_query, st.session_state.chunks)
-
+        # Generate Assistant response
         with st.chat_message("assistant"):
-            if api_key_input:
-                with st.spinner("Analyzing document and generating answer..."):
-                    answer = answer_with_gemini(api_key_input, user_query, relevant_chunks)
-            else:
-                answer = (
-                    "⚠️ **No API Key Provided**: Operating in demo/retrieval-only mode.\n\n"
-                    "Here are the most relevant excerpts found for your query from the document:\n\n"
-                    + "\n\n".join([f"- **(Page {c['page']})**: {c['content']}" for c in relevant_chunks])
-                    + "\n\n*Add a Gemini API key in the sidebar to get synthesized conversational answers!*"
+            with st.spinner("Searching document context and generating answer..."):
+                response: RAGResponse = st.session_state.rag_pipeline.query(
+                    question=user_query,
+                    conversation_history=st.session_state.chat_history
                 )
-            
-            st.markdown(answer)
-            if api_key_input and relevant_chunks:
-                with st.expander("📚 View Reference Passages"):
-                    for s in relevant_chunks:
-                        st.markdown(f"**Page {s['page']}**")
-                        st.markdown(f"> {s['content']}")
+                
+                st.markdown(response.answer)
 
-        st.session_state.chat_history.append({
-            "role": "assistant",
-            "content": answer,
-            "sources": relevant_chunks if api_key_input else []
-        })
+                citations_data = [
+                    {
+                        "doc_name": c.doc_name,
+                        "page": c.page,
+                        "chunk_id": c.chunk_id,
+                        "snippet": c.snippet
+                    }
+                    for c in response.citations
+                ]
+
+                if citations_data:
+                    with st.expander("📚 View Reference Citations"):
+                        for idx, cit in enumerate(citations_data, 1):
+                            st.markdown(
+                                f"<div class='citation-card'>"
+                                f"<span class='citation-badge'>Citation {idx}</span> "
+                                f"<strong>{cit['doc_name']}</strong> — Page {cit['page']}<br>"
+                                f"<em>\"{cit['snippet']}\"</em>"
+                                f"</div>",
+                                unsafe_allow_html=True
+                            )
+
+            st.session_state.chat_history.append({
+                "role": "assistant",
+                "content": response.answer,
+                "citations": citations_data,
+                "model_used": response.model_used
+            })
+
+    # Export Chat Option
+    if st.session_state.chat_history:
+        st.markdown("<br>", unsafe_allow_html=True)
+        export_text = f"# AI PDF Q&A Assistant - Chat Export\nGenerated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n---\n\n"
+        for m in st.session_state.chat_history:
+            role_title = "**User**" if m["role"] == "user" else "**Assistant**"
+            export_text += f"{role_title}:\n{m['content']}\n\n"
+            if m.get("citations"):
+                export_text += "*Citations:*\n"
+                for c in m["citations"]:
+                    export_text += f"- [{c['doc_name']}, Page {c['page']}]: {c['snippet']}\n"
+                export_text += "\n"
+            export_text += "---\n\n"
+
+        st.download_button(
+            label="📥 Download Q&A Transcript (Markdown)",
+            data=export_text,
+            file_name=f"pdf_qa_transcript_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+            mime="text/markdown"
+        )

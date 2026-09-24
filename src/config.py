@@ -1,10 +1,12 @@
 import os
 from dataclasses import dataclass, field
 from typing import Optional
-from dotenv import load_dotenv
-
-# Load .env file automatically
-load_dotenv()
+# Load .env file automatically if python-dotenv is installed
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 @dataclass

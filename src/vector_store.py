@@ -5,12 +5,25 @@ import numpy as np
 
 from src.pdf_processor import DocumentChunk
 
-# Graceful optional import of Google Gemini SDK
+import warnings
+
+# Support modern google.genai SDK
 try:
-    import google.generativeai as genai
-    HAS_GENAI = True
+    from google import genai
+    HAS_NEW_GENAI = True
 except ImportError:
-    HAS_GENAI = False
+    HAS_NEW_GENAI = False
+
+# Support legacy google.generativeai SDK with clean warning suppression
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=FutureWarning)
+    try:
+        import google.generativeai as legacy_genai
+        HAS_LEGACY_GENAI = True
+    except ImportError:
+        HAS_LEGACY_GENAI = False
+
+HAS_GENAI = HAS_NEW_GENAI or HAS_LEGACY_GENAI
 
 
 class OfflineTFIDFEmbedder:
@@ -96,13 +109,22 @@ class VectorStore:
         self.vectors: Optional[np.ndarray] = None
         self.offline_embedder = OfflineTFIDFEmbedder()
         self.is_using_gemini: bool = False
+        self.new_client = None
 
-        if self.api_key and HAS_GENAI:
-            try:
-                genai.configure(api_key=self.api_key)
-                self.is_using_gemini = True
-            except Exception:
-                self.is_using_gemini = False
+        if self.api_key:
+            if HAS_NEW_GENAI:
+                try:
+                    self.new_client = genai.Client(api_key=self.api_key)
+                    self.is_using_gemini = True
+                except Exception:
+                    self.new_client = None
+
+            if not self.is_using_gemini and HAS_LEGACY_GENAI:
+                try:
+                    legacy_genai.configure(api_key=self.api_key)
+                    self.is_using_gemini = True
+                except Exception:
+                    self.is_using_gemini = False
 
     def clear(self):
         """Reset the vector store."""
@@ -112,19 +134,41 @@ class VectorStore:
 
     def get_embedding(self, text: str) -> np.ndarray:
         """Computes embedding vector for a piece of text."""
-        if self.is_using_gemini and HAS_GENAI:
-            try:
-                result = genai.embed_content(
-                    model=self.embedding_model,
-                    content=text,
-                    task_type="retrieval_document"
-                )
-                vec = np.array(result["embedding"], dtype=np.float32)
-                norm = np.linalg.norm(vec)
-                return vec / norm if norm > 0 else vec
-            except Exception:
-                # Fallback to local embedder if API fails or quota exceeded
-                pass
+        # Normalize model name for embeddings
+        model_name = self.embedding_model
+        if "/" in model_name:
+            clean_model = model_name.split("/")[-1]
+        else:
+            clean_model = model_name
+
+        if self.is_using_gemini:
+            # 1. Try modern google-genai SDK
+            if HAS_NEW_GENAI and self.new_client is not None:
+                try:
+                    res = self.new_client.models.embed_content(
+                        model=clean_model,
+                        contents=text
+                    )
+                    if hasattr(res, "embeddings") and res.embeddings:
+                        vec = np.array(res.embeddings[0].values, dtype=np.float32)
+                        norm = np.linalg.norm(vec)
+                        return vec / norm if norm > 0 else vec
+                except Exception:
+                    pass
+
+            # 2. Try legacy google.generativeai SDK
+            if HAS_LEGACY_GENAI:
+                try:
+                    result = legacy_genai.embed_content(
+                        model=model_name if "models/" in model_name else f"models/{model_name}",
+                        content=text,
+                        task_type="retrieval_document"
+                    )
+                    vec = np.array(result["embedding"], dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    return vec / norm if norm > 0 else vec
+                except Exception:
+                    pass
 
         return self.offline_embedder.transform(text)
 

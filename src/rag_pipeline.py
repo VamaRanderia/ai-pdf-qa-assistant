@@ -7,12 +7,25 @@ from src.config import RAGConfig, default_config
 from src.pdf_processor import DocumentChunk
 from src.vector_store import VectorStore
 
-# Optional Gemini SDK import
+import warnings
+
+# Support modern google.genai SDK
 try:
-    import google.generativeai as genai
-    HAS_GENAI = True
+    from google import genai
+    HAS_NEW_GENAI = True
 except ImportError:
-    HAS_GENAI = False
+    HAS_NEW_GENAI = False
+
+# Support legacy google.generativeai SDK with clean warning suppression
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", category=FutureWarning)
+    try:
+        import google.generativeai as legacy_genai
+        HAS_LEGACY_GENAI = True
+    except ImportError:
+        HAS_LEGACY_GENAI = False
+
+HAS_GENAI = HAS_NEW_GENAI or HAS_LEGACY_GENAI
 
 
 @dataclass
@@ -53,12 +66,18 @@ class RAGPipeline:
         """Dynamically update Gemini API key."""
         self.config.gemini_api_key = api_key
         self.vector_store.api_key = api_key
-        if api_key and HAS_GENAI:
-            try:
-                genai.configure(api_key=api_key)
-                self.vector_store.is_using_gemini = True
-            except Exception:
-                self.vector_store.is_using_gemini = False
+        self.vector_store.is_using_gemini = bool(api_key and HAS_GENAI)
+        if api_key:
+            if HAS_NEW_GENAI:
+                try:
+                    self.vector_store.new_client = genai.Client(api_key=api_key)
+                except Exception:
+                    self.vector_store.new_client = None
+            if HAS_LEGACY_GENAI:
+                try:
+                    legacy_genai.configure(api_key=api_key)
+                except Exception:
+                    pass
 
     def build_context(self, retrieved: List[Tuple[DocumentChunk, float]]) -> str:
         """Formats retrieved chunks into a clean, annotated context block."""
@@ -171,38 +190,61 @@ Answer:"""
         # 2. Check if Gemini API is available and key is configured
         api_key = self.config.gemini_api_key
         if api_key and HAS_GENAI:
-            try:
-                genai.configure(api_key=api_key)
-                context = self.build_context(retrieved)
-                prompt = self.build_prompt(question, context, conversation_history)
-                
-                model = genai.GenerativeModel(self.config.llm_model_name)
-                generation_config = {
-                    "temperature": self.config.temperature,
-                    "max_output_tokens": self.config.max_output_tokens
-                }
-                
-                response = model.generate_content(prompt, generation_config=generation_config)
-                generated_text = response.text.strip()
+            context = self.build_context(retrieved)
+            prompt = self.build_prompt(question, context, conversation_history)
+            clean_model = self.config.llm_model_name.split("/")[-1]
 
-                return RAGResponse(
-                    question=question,
-                    answer=generated_text,
-                    sources=sources,
-                    citations=citations,
-                    has_llm_answer=True,
-                    model_used=self.config.llm_model_name
-                )
-            except Exception as exc:
-                fallback = self.generate_extractive_fallback(question, retrieved)
-                return RAGResponse(
-                    question=question,
-                    answer=f"⚠️ LLM Error ({exc}). Falling back to extracted citations:\n\n{fallback}",
-                    sources=sources,
-                    citations=citations,
-                    has_llm_answer=False,
-                    model_used="Extractive Fallback"
-                )
+            # Try modern google-genai SDK first
+            if HAS_NEW_GENAI:
+                try:
+                    client = genai.Client(api_key=api_key)
+                    response = client.models.generate_content(
+                        model=clean_model,
+                        contents=prompt,
+                    )
+                    generated_text = (response.text or "").strip()
+                    if generated_text:
+                        return RAGResponse(
+                            question=question,
+                            answer=generated_text,
+                            sources=sources,
+                            citations=citations,
+                            has_llm_answer=True,
+                            model_used=f"{clean_model} (google-genai)"
+                        )
+                except Exception:
+                    pass
+
+            # Try legacy google.generativeai SDK
+            if HAS_LEGACY_GENAI:
+                try:
+                    legacy_genai.configure(api_key=api_key)
+                    model = legacy_genai.GenerativeModel(self.config.llm_model_name)
+                    generation_config = {
+                        "temperature": self.config.temperature,
+                        "max_output_tokens": self.config.max_output_tokens
+                    }
+                    response = model.generate_content(prompt, generation_config=generation_config)
+                    generated_text = (response.text or "").strip()
+
+                    return RAGResponse(
+                        question=question,
+                        answer=generated_text,
+                        sources=sources,
+                        citations=citations,
+                        has_llm_answer=True,
+                        model_used=self.config.llm_model_name
+                    )
+                except Exception as exc:
+                    fallback = self.generate_extractive_fallback(question, retrieved)
+                    return RAGResponse(
+                        question=question,
+                        answer=f"⚠️ LLM Error ({exc}). Falling back to extracted citations:\n\n{fallback}",
+                        sources=sources,
+                        citations=citations,
+                        has_llm_answer=False,
+                        model_used="Extractive Fallback"
+                    )
 
         # 3. Extractive response when running offline or without key
         fallback_answer = self.generate_extractive_fallback(question, retrieved)
